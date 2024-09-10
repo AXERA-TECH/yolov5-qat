@@ -48,6 +48,10 @@ from models.common import (
     GhostBottleneck,
     GhostConv,
     Proto,
+    Resize,
+    C3R,
+    ConvR,
+    ConcatX,
 )
 from models.experimental import MixConv2d
 from utils.autoanchor import check_anchor_order
@@ -70,8 +74,7 @@ except ImportError:
 
 
 class Detect(nn.Module):
-    """YOLOv5 Detect head for processing input tensors and generating detection outputs in object detection models."""
-
+    # YOLOv5 Detect head for detection models
     stride = None  # strides computed during build
     dynamic = False  # force grid reconstruction
     export = False  # export mode
@@ -89,11 +92,23 @@ class Detect(nn.Module):
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
         self.inplace = inplace  # use inplace ops (e.g. slice assignment)
 
+        self.dequant0 = torch.ao.quantization.DeQuantStub()
+        self.dequant1 = torch.ao.quantization.DeQuantStub()
+        self.dequant2 = torch.ao.quantization.DeQuantStub()
+
     def forward(self, x):
         """Processes input through YOLOv5 layers, altering shape for detection: `x(bs, 3, ny, nx, 85)`."""
         z = []  # inference output
         for i in range(self.nl):
             x[i] = self.m[i](x[i])  # conv
+
+            if i == 0:
+                x[i] = self.dequant0(x[i])
+            elif i == 1:
+                x[i] = self.dequant0(x[i])
+            elif i == 2:
+                x[i] = self.dequant0(x[i]) 
+            
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
             x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
@@ -128,8 +143,7 @@ class Detect(nn.Module):
 
 
 class Segment(Detect):
-    """YOLOv5 Segment head for segmentation models, extending Detect with mask and prototype layers."""
-
+    # YOLOv5 Segment head for segmentation models
     def __init__(self, nc=80, anchors=(), nm=32, npr=256, ch=(), inplace=True):
         """Initializes YOLOv5 Segment head with options for mask count, protos, and channel adjustments."""
         super().__init__(nc, anchors, ch, inplace)
@@ -139,6 +153,7 @@ class Segment(Detect):
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
         self.proto = Proto(ch[0], self.npr, self.nm)  # protos
         self.detect = Detect.forward
+        self.quant = torch.ao.quantization.QuantStub()
 
     def forward(self, x):
         """Processes input through the network, returning detections and prototypes; adjusts output based on
@@ -152,24 +167,28 @@ class Segment(Detect):
 class BaseModel(nn.Module):
     """YOLOv5 base model."""
 
+
+    def __init__(self):
+        super().__init__()
+        self.quant = torch.ao.quantization.QuantStub()
+        
     def forward(self, x, profile=False, visualize=False):
         """Executes a single-scale inference or training pass on the YOLOv5 base model, with options for profiling and
         visualization.
         """
+
         return self._forward_once(x, profile, visualize)  # single-scale inference, train
 
     def _forward_once(self, x, profile=False, visualize=False):
         """Performs a forward pass on the YOLOv5 model, enabling profiling and feature visualization options."""
         y, dt = [], []  # outputs
         for m in self.model:
+
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
-            if profile:
-                self._profile_one_layer(m, x, dt)
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
-            if visualize:
-                feature_visualization(x, m.type, m.i, save_dir=visualize)
+            
         return x
 
     def _profile_one_layer(self, m, x, dt):
@@ -187,6 +206,7 @@ class BaseModel(nn.Module):
             LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
 
     def fuse(self):
+        return self
         """Fuses Conv2d() and BatchNorm2d() layers in the model to improve inference speed."""
         LOGGER.info("Fusing layers... ")
         for m in self.model.modules():
@@ -216,8 +236,7 @@ class BaseModel(nn.Module):
 
 
 class DetectionModel(BaseModel):
-    """YOLOv5 detection model class for object detection tasks, supporting custom configurations and anchors."""
-
+    # YOLOv5 detection model
     def __init__(self, cfg="yolov5s.yaml", ch=3, nc=None, anchors=None):
         """Initializes YOLOv5 model with configuration file, input channels, number of classes, and custom anchors."""
         super().__init__()
@@ -242,11 +261,14 @@ class DetectionModel(BaseModel):
         self.names = [str(i) for i in range(self.yaml["nc"])]  # default names
         self.inplace = self.yaml.get("inplace", True)
 
+        self.quant = torch.ao.quantization.QuantStub()
+        self.dequant = torch.ao.quantization.DeQuantStub()
         # Build strides, anchors
         m = self.model[-1]  # Detect()
         if isinstance(m, (Detect, Segment)):
 
             def _forward(x):
+                self.quant(x)
                 """Passes the input 'x' through the model and returns the processed output."""
                 return self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
 
@@ -265,8 +287,11 @@ class DetectionModel(BaseModel):
 
     def forward(self, x, augment=False, profile=False, visualize=False):
         """Performs single-scale or augmented inference and may include profiling or visualization."""
-        if augment:
-            return self._forward_augment(x)  # augmented inference, None
+        
+        x = self.quant(x)
+
+        # if augment:
+            # return se/lf._forward_augment(x)  # augmented inference, None
         return self._forward_once(x, profile, visualize)  # single-scale inference, train
 
     def _forward_augment(self, x):
@@ -331,20 +356,45 @@ class DetectionModel(BaseModel):
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
 
+    def fuse_model(self):
+        for m in self.modules():
+            if type(m) == Conv:
+                torch.ao.quantization.fuse_modules(m, ['conv', 'act'], inplace=True)
+                # torch.ao.quantization.fuse_modules(m, ['conv', 'bn'], inplace=True)
+
+    def simple(self, quantizer):
+        activation_quant = quantizer.FakeQuantize.with_args(
+                    observer=quantizer.MovingAverageMinMaxObserver.with_args(dtype=torch.quint8), 
+                    quant_min=0, quant_max=255, dtype=torch.quint8, qscheme=torch.per_tensor_affine, reduce_range=False)
+        weight_quant = quantizer.FakeQuantize.with_args(
+                    observer=quantizer.MovingAveragePerChannelMinMaxObserver.with_args(dtype=torch.qint8), 
+                    quant_min=-128, quant_max=127, dtype=torch.qint8, qscheme=torch.per_channel_symmetric, reduce_range=False)         
+
+        for node in self.modules():
+            if type(node) == Conv or type(node) == ConvR:
+                if isinstance(node, (Conv, DWConv, ConvR)) and hasattr(node, "bn"):
+                    qconfig = quantizer.QConfig(activation=torch.nn.Identity, weight=weight_quant)
+                    node.conv.qconfig = qconfig
+            if type(node) == nn.Upsample:
+                qconfig = quantizer.QConfig(activation=activation_quant, weight=weight_quant)
+                node.qconfig = qconfig
+            if type(node) == SPPF:
+                if type(node.cv1) == ConvR:
+                    qconfig = quantizer.QConfig(activation=torch.nn.Identity, weight=weight_quant)
+                    node.cv1.conv.qconfig = qconfig
+
 Model = DetectionModel  # retain YOLOv5 'Model' class for backwards compatibility
 
 
 class SegmentationModel(DetectionModel):
-    """YOLOv5 segmentation model for object detection and segmentation tasks with configurable parameters."""
-
+    # YOLOv5 segmentation model
     def __init__(self, cfg="yolov5s-seg.yaml", ch=3, nc=None, anchors=None):
         """Initializes a YOLOv5 segmentation model with configurable params: cfg (str) for configuration, ch (int) for channels, nc (int) for num classes, anchors (list)."""
         super().__init__(cfg, ch, nc, anchors)
 
 
 class ClassificationModel(BaseModel):
-    """YOLOv5 classification model for image classification tasks, initialized with a config file or detection model."""
-
+    # YOLOv5 classification model
     def __init__(self, cfg=None, model=None, nc=1000, cutoff=10):
         """Initializes YOLOv5 model with config file `cfg`, input channels `ch`, number of classes `nc`, and `cuttoff`
         index.
@@ -420,6 +470,8 @@ def parse_model(d, ch):
             nn.ConvTranspose2d,
             DWConvTranspose2d,
             C3x,
+            C3R,
+            ConvR,
         }:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
@@ -431,7 +483,7 @@ def parse_model(d, ch):
                 n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
-        elif m is Concat:
+        elif m in [Concat, ConcatX]:
             c2 = sum(ch[x] for x in f)
         # TODO: channel, gw, gd
         elif m in {Detect, Segment}:
@@ -444,6 +496,9 @@ def parse_model(d, ch):
             c2 = ch[f] * args[0] ** 2
         elif m is Expand:
             c2 = ch[f] // args[0] ** 2
+        elif m is nn.Upsample:
+            m = Resize
+            c2 = ch[f]
         else:
             c2 = ch[f]
 

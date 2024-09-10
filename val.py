@@ -11,7 +11,7 @@ Usage - formats:
                               yolov5s.onnx               # ONNX Runtime or OpenCV DNN with --dnn
                               yolov5s_openvino_model     # OpenVINO
                               yolov5s.engine             # TensorRT
-                              yolov5s.mlpackage          # CoreML (macOS-only)
+                              yolov5s.mlmodel            # CoreML (macOS-only)
                               yolov5s_saved_model        # TensorFlow SavedModel
                               yolov5s.pb                 # TensorFlow GraphDef
                               yolov5s.tflite             # TensorFlow Lite
@@ -258,7 +258,8 @@ def run(
     if training:  # called by train.py
         device, pt, jit, engine = next(model.parameters()).device, True, False, False  # get model device, PyTorch model
         half &= device.type != "cpu"  # half precision only supported on CUDA
-        model.half() if half else model.float()
+        # model.half() if half else model.float()
+        model.float()
     else:  # called directly
         device = select_device(device, batch_size=batch_size)
 
@@ -270,7 +271,7 @@ def run(
         model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
         stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
         imgsz = check_img_size(imgsz, s=stride)  # check image size
-        half = model.fp16  # FP16 supported on limited backends with CUDA
+        # half = model.fp16  # FP16 supported on limited backends with CUDA
         if engine:
             batch_size = model.batch_size
         else:
@@ -332,7 +333,8 @@ def run(
             if cuda:
                 im = im.to(device, non_blocking=True)
                 targets = targets.to(device)
-            im = im.half() if half else im.float()  # uint8 to fp16/32
+            # im = im.half() if half else im.float()  # uint8 to fp16/32
+            im = im.float()
             im /= 255  # 0 - 255 to 0.0 - 1.0
             nb, _, height, width = im.shape  # batch size, channels, height, width
 
@@ -576,7 +578,7 @@ def main(opt):
 
     else:
         weights = opt.weights if isinstance(opt.weights, list) else [opt.weights]
-        opt.half = torch.cuda.is_available() and opt.device != "cpu"  # FP16 for fastest results
+        # opt.half = torch.cuda.is_available() and opt.device != "cpu"  # FP16 for fastest results
         if opt.task == "speed":  # speed benchmarks
             # python val.py --task speed --data coco.yaml --batch 1 --weights yolov5n.pt yolov5s.pt...
             opt.conf_thres, opt.iou_thres, opt.save_json = 0.25, 0.45, False

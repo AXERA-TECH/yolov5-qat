@@ -119,7 +119,7 @@ def train(hyp, opt, device, callbacks):
     Example:
         Single-GPU training:
         ```bash
-        $ python train.py --data coco128.yaml --weights yolov5s.pt --img 640  # from pretrained (recommended)
+        $ python train.py --data coco128.yaml --weights yolov5s.pt -- 640  # from pretrained (recommended)
         $ python train.py --data coco128.yaml --weights '' --cfg yolov5s.yaml --img 640  # from scratch
         ```
 
@@ -223,6 +223,25 @@ def train(hyp, opt, device, callbacks):
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)  # create
     amp = check_amp(model)  # check AMP
 
+    model.eval()
+    # model.fuse_model()
+
+    import torch.ao.quantization as quantizer
+
+    activation_quant = quantizer.FakeQuantize.with_args(
+                observer=quantizer.MovingAverageMinMaxObserver.with_args(dtype=torch.quint8), 
+                quant_min=0, quant_max=255, dtype=torch.quint8, qscheme=torch.per_tensor_affine, reduce_range=False)
+    weight_quant = quantizer.FakeQuantize.with_args(
+                observer=quantizer.MovingAveragePerChannelMinMaxObserver.with_args(dtype=torch.qint8), 
+                quant_min=-128, quant_max=127, dtype=torch.qint8, qscheme=torch.per_channel_symmetric, reduce_range=False)         
+
+
+    qconfig = quantizer.QConfig(activation=activation_quant, weight=weight_quant)
+    model.qconfig = qconfig
+    model.train()
+    model.simple(quantizer)
+    torch.quantization.prepare_qat(model, inplace=True)
+    
     # Freeze
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
@@ -235,7 +254,7 @@ def train(hyp, opt, device, callbacks):
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)  # verify imgsz is gs-multiple
-
+    
     # Batch size
     if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
         batch_size = check_train_batch_size(model, imgsz, amp)
@@ -362,11 +381,11 @@ def train(hyp, opt, device, callbacks):
         f"Logging results to {colorstr('bold', save_dir)}\n"
         f'Starting training for {epochs} epochs...'
     )
+
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         callbacks.run("on_train_epoch_start")
-        model.train()
 
-        # Update image weights (optional, single-GPU only)
+        model.train()
         if opt.image_weights:
             cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
             iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
@@ -387,8 +406,8 @@ def train(hyp, opt, device, callbacks):
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-
+            
+            imgs = imgs.to(device, non_blocking=True).float() / 255 # uint8 to float32, 0-255 to 0.0-1.0
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
@@ -396,10 +415,10 @@ def train(hyp, opt, device, callbacks):
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x["lr"] = np.interp(ni, xi, [hyp["warmup_bias_lr"] if j == 0 else 0.0, x["initial_lr"] * lf(epoch)])
+                    x["lr"] = 0.01
                     if "momentum" in x:
                         x["momentum"] = np.interp(ni, xi, [hyp["warmup_momentum"], hyp["momentum"]])
-
+    
             # Multi-scale
             if opt.multi_scale:
                 sz = random.randrange(int(imgsz * 0.5), int(imgsz * 1.5) + gs) // gs * gs  # size
@@ -407,9 +426,8 @@ def train(hyp, opt, device, callbacks):
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
-
             # Forward
-            with torch.cuda.amp.autocast(amp):
+            with torch.cuda.amp.autocast( amp):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                 if RANK != -1:
@@ -427,8 +445,8 @@ def train(hyp, opt, device, callbacks):
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
-                if ema:
-                    ema.update(model)
+                # if ema:
+                    # ema.update(model)
                 last_opt_step = ni
 
             # Log
@@ -443,7 +461,13 @@ def train(hyp, opt, device, callbacks):
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
-
+            if epoch == 0:
+                # Freeze quantizer parameters
+                model.apply(torch.ao.quantization.disable_observer)
+                
+                # Freeze batch norm mean and variance estimates
+                model.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
+                
         # Scheduler
         lr = [x["lr"] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
@@ -478,18 +502,19 @@ def train(hyp, opt, device, callbacks):
 
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
+                # model = torch.quantization.convert
                 ckpt = {
-                    "epoch": epoch,
-                    "best_fitness": best_fitness,
-                    "model": deepcopy(de_parallel(model)).half(),
-                    "ema": deepcopy(ema.ema).half(),
-                    "updates": ema.updates,
-                    "optimizer": optimizer.state_dict(),
-                    "opt": vars(opt),
-                    "git": GIT_INFO,  # {remote, branch, commit} if a git repo
-                    "date": datetime.now().isoformat(),
+                    'epoch': epoch,
+                    'best_fitness': best_fitness,
+                    # 'model': deepcopy(de_parallel(model)).half(),
+                    # 'ema': deepcopy(ema.ema).half(),
+                    # 'updates': ema.updates,
+                    'model': deepcopy(de_parallel(model)).half().state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'opt': vars(opt),
+                    # 'git': GIT_INFO,  # {remote, branch, commit} if a git repo
+                    'date': datetime.now().isoformat()
                 }
-
                 # Save last, best and delete
                 torch.save(ckpt, last)
                 if best_fitness == fi:
@@ -521,7 +546,7 @@ def train(hyp, opt, device, callbacks):
                         data_dict,
                         batch_size=batch_size // WORLD_SIZE * 2,
                         imgsz=imgsz,
-                        model=attempt_load(f, device).half(),
+                        model=model,#attempt_load(f, device).half(),
                         iou_thres=0.65 if is_coco else 0.60,  # best pycocotools at iou 0.65
                         single_cls=single_cls,
                         dataloader=val_loader,
@@ -536,6 +561,10 @@ def train(hyp, opt, device, callbacks):
                         callbacks.run("on_fit_epoch_end", list(mloss) + list(results) + lr, epoch, best_fitness, fi)
 
         callbacks.run("on_train_end", last, best, epoch, results)
+
+    import export_qat as ep
+
+    ep.run(model=model, include=['onnx'],device="cpu")
 
     torch.cuda.empty_cache()
     return results

@@ -22,9 +22,11 @@ class Sum(nn.Module):
         self.iter = range(n - 1)  # iter object
         if weight:
             self.w = nn.Parameter(-torch.arange(1.0, n) / 2, requires_grad=True)  # layer weights
-
+        self.quant = torch.ao.quantization.QuantStub()
+        
     def forward(self, x):
         """Processes input through a customizable weighted sum of `n` inputs, optionally applying learned weights."""
+        # self.quant(x)
         y = x[0]  # no weight
         if self.weight:
             w = torch.sigmoid(self.w) * 2
@@ -33,6 +35,7 @@ class Sum(nn.Module):
         else:
             for i in self.iter:
                 y = y + x[i + 1]
+        # self.quant(y)
         return y
 
 
@@ -85,6 +88,7 @@ class Ensemble(nn.ModuleList):
         return y, None  # inference, train output
 
 
+
 def attempt_load(weights, device=None, inplace=True, fuse=True):
     """
     Loads and fuses an ensemble or single YOLOv5 model from weights, handling device placement and model adjustments.
@@ -97,6 +101,59 @@ def attempt_load(weights, device=None, inplace=True, fuse=True):
     for w in weights if isinstance(weights, list) else [weights]:
         ckpt = torch.load(attempt_download(w), map_location="cpu")  # load
         ckpt = (ckpt.get("ema") or ckpt["model"]).to(device).float()  # FP32 model
+
+        # Model compatibility updates
+        if not hasattr(ckpt, "stride"):
+            ckpt.stride = torch.tensor([32.0])
+        if hasattr(ckpt, "names") and isinstance(ckpt.names, (list, tuple)):
+            ckpt.names = dict(enumerate(ckpt.names))  # convert to dict
+
+        model.append(ckpt.fuse().eval() if fuse and hasattr(ckpt, "fuse") else ckpt.eval())  # model in eval mode
+
+    # Module updates
+    for m in model.modules():
+        t = type(m)
+        if t in (nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU, Detect, Model):
+            m.inplace = inplace
+            if t is Detect and not isinstance(m.anchor_grid, list):
+                delattr(m, "anchor_grid")
+                setattr(m, "anchor_grid", [torch.zeros(1)] * m.nl)
+        elif t is nn.Upsample and not hasattr(m, "recompute_scale_factor"):
+            m.recompute_scale_factor = None  # torch 1.11.0 compatibility
+
+    # Return model
+    if len(model) == 1:
+        return model[-1]
+
+    # Return detection ensemble
+    print(f"Ensemble created with {weights}\n")
+    for k in "names", "nc", "yaml":
+        setattr(model, k, getattr(model[0], k))
+    model.stride = model[torch.argmax(torch.tensor([m.stride.max() for m in model])).int()].stride  # max stride
+    assert all(model[0].nc == m.nc for m in model), f"Models have different class counts: {[m.nc for m in model]}"
+    return model
+
+
+
+def attempt_load_val(weights, device=None, inplace=True, fuse=True):
+    """
+    Loads and fuses an ensemble or single YOLOv5 model from weights, handling device placement and model adjustments.
+
+    Example inputs: weights=[a,b,c] or a single model weights=[a] or weights=a.
+    """
+    from models.yolo import Detect, Model
+
+    model = Ensemble()
+    det_model = Model()
+    print(Model)
+    print(weights)
+    for w in weights if isinstance(weights, list) else [weights]:
+        # ckpt = torch.load(attempt_download(w), map_location="cpu")  # load
+        det_model = torch.nn.DataParallel(det_model)
+        det_model.load_state_dict(torch.load(w))
+        
+        ckpt = det_model.eval()
+        # ckpt = (ckpt.get("ema") or ckpt["model"]).to(device).float()  # FP32 model
 
         # Model compatibility updates
         if not hasattr(ckpt, "stride"):
