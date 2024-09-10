@@ -1,5 +1,7 @@
 # 从 0 到 1 部署 PyTorch QAT 训练
 
+切换到分支：axera-yolov5-qat
+
 ## 0X01 简介
 
 本篇介绍的 QAT 训练是基于 PyTorch 训练框架中的 Eager Mode 方式。QAT是以插入 Fake Quant Node 的方法介入到训练前期模型的训练。
