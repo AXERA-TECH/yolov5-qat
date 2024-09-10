@@ -278,6 +278,12 @@ class Resize(nn.Module):
 ```
 python3 train.py --data coco128.yaml --weights yolov5s.pt --batch-size 64 --device 1 --cfg yolov5s_qat.yaml
 ```
+通过此命令会在项目中生成 yolov5s.onnx,需要用过 onnxsim 进行模型 sim
+```
+onnxsim yolov5s.onnx yolov5s_sim.onnx
+```
+最终的 yolov5s_sim.onnx 为包含 qdq 算子的量化模型
+
 
 上述就是对 yolov5 训练侧添加 qdq 算子的初步简介
 
